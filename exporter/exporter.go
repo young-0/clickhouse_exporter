@@ -19,45 +19,43 @@ const (
 	namespace = "clickhouse" // For Prometheus metrics.
 )
 
+
+
+var CacheResult []cdpEventsResult
+
+
 // Exporter collects clickhouse stats from the given URI and exports them using
 // the prometheus metrics package.
 type Exporter struct {
-	metricsURI      string
-	asyncMetricsURI string
-	eventsURI       string
+	// metricsURI      string
+	// asyncMetricsURI string
+	// eventsURI       string
+
 	partsURI        string
 	client          *http.Client
+
+	ckDomain url.URL
+	cdpEventsURI string
+	cdpEventsTableList []string
 
 	scrapeFailures prometheus.Counter
 
 	user     string
 	password string
+
 }
 
 // NewExporter returns an initialized Exporter.
 func NewExporter(uri url.URL, insecure bool, user, password string) *Exporter {
 	q := uri.Query()
-	metricsURI := uri
-	q.Set("query", "select metric, value from system.metrics")
-	metricsURI.RawQuery = q.Encode()
-
-	asyncMetricsURI := uri
-	q.Set("query", "select replaceRegexpAll(toString(metric), '-', '_') AS metric, value from system.asynchronous_metrics")
-	asyncMetricsURI.RawQuery = q.Encode()
-
-	eventsURI := uri
-	q.Set("query", "select event, value from system.events")
-	eventsURI.RawQuery = q.Encode()
 
 	partsURI := uri
 	q.Set("query", "select database, table, sum(bytes) as bytes, count() as parts, sum(rows) as rows from system.parts where active = 1 group by database, table")
 	partsURI.RawQuery = q.Encode()
 
 	return &Exporter{
-		metricsURI:      metricsURI.String(),
-		asyncMetricsURI: asyncMetricsURI.String(),
-		eventsURI:       eventsURI.String(),
-		partsURI:        partsURI.String(),
+		ckDomain: uri,
+		partsURI:   partsURI.String(),
 		scrapeFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "exporter_scrape_failures_total",
@@ -96,81 +94,68 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	<-doneCh
 }
 
+func (e *Exporter) getCdpEventsTableList() error {
+	uri := e.ckDomain
+	q := uri.Query()
+
+	getTableListURI := uri
+	q.Set("query", "select name from system.tables where multiMatchAny(name, ['cdp_events_[0-9].+'])")
+	getTableListURI.RawQuery = q.Encode()
+
+	data, err := e.handleResponse(getTableListURI.String())
+	if err != nil {
+		return err
+	}
+	// fmt.Printf("getCdpEventsTableList data: %s",data)
+	// Parsing results
+	lines := strings.Split(string(data), "\n")
+
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		// fmt.Printf("%d:%s\n",i,line)
+	}
+	e.cdpEventsTableList = lines
+
+	return nil
+	// if err != nil {
+	// 	fmt.Errorf("Error scraping clickhouse url %v: %v", e.cdpTableNameURI, err)
+	// }
+
+	// return &events_table_list
+}
+
 func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
-	metrics, err := e.parseKeyValueResponse(e.metricsURI)
+	events, err := e.parseCdpEventsResponse()
 	if err != nil {
-		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.metricsURI, err)
+		return fmt.Errorf("Error scraping parseCdpEventsResponse: %v", err)
 	}
-
-	for _, m := range metrics {
-		newMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      metricName(m.key),
-			Help:      "Number of " + m.key + " currently processed",
-		}, []string{}).WithLabelValues()
-		newMetric.Set(m.value)
-		newMetric.Collect(ch)
-	}
-
-	asyncMetrics, err := e.parseKeyValueResponse(e.asyncMetricsURI)
-	if err != nil {
-		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.asyncMetricsURI, err)
-	}
-
-	for _, am := range asyncMetrics {
-		newMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      metricName(am.key),
-			Help:      "Number of " + am.key + " async processed",
-		}, []string{}).WithLabelValues()
-		newMetric.Set(am.value)
-		newMetric.Collect(ch)
-	}
-
-	events, err := e.parseKeyValueResponse(e.eventsURI)
-	if err != nil {
-		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.eventsURI, err)
-	}
-
-	for _, ev := range events {
-		newMetric, _ := prometheus.NewConstMetric(
-			prometheus.NewDesc(
-				namespace+"_"+metricName(ev.key)+"_total",
-				"Number of "+ev.key+" total processed", []string{}, nil),
-			prometheus.CounterValue, float64(ev.value))
-		ch <- newMetric
-	}
-
-	parts, err := e.parsePartsResponse(e.partsURI)
-	if err != nil {
-		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.partsURI, err)
-	}
-
-	for _, part := range parts {
-		newBytesMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "table_parts_bytes",
-			Help:      "Table size in bytes",
-		}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
-		newBytesMetric.Set(float64(part.bytes))
-		newBytesMetric.Collect(ch)
-
-		newCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "table_parts_count",
-			Help:      "Number of parts of the table",
-		}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
-		newCountMetric.Set(float64(part.parts))
-		newCountMetric.Collect(ch)
-
+	for _, event := range events {
 		newRowsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "table_parts_rows",
-			Help:      "Number of rows in the table",
-		}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
-		newRowsMetric.Set(float64(part.rows))
+			Name:      "cdp_events_count",
+			Help:      "cdp events table count",
+		}, []string{"table"}).WithLabelValues( event.table)
+		newRowsMetric.Set(float64(event.count))
 		newRowsMetric.Collect(ch)
 	}
+
+	//
+	// parts, err := e.parsePartsResponse(e.partsURI)
+	// if err != nil {
+	// 	return fmt.Errorf("Error scraping clickhouse url %v: %v", e.partsURI, err)
+	// }
+	// for _, part := range parts {
+	// 	newRowsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	// 		Namespace: namespace,
+	// 		Name:      "table_parts_rows",
+	// 		Help:      "Number of rows in the table",
+	// 	}, []string{"database", "table"}).WithLabelValues(part.database, part.table)
+	// 	newRowsMetric.Set(float64(part.rows))
+	// 	newRowsMetric.Collect(ch)
+	// }
 
 	return nil
 }
@@ -215,35 +200,6 @@ func parseNumber(s string) (float64, error) {
 	return v, nil
 }
 
-func (e *Exporter) parseKeyValueResponse(uri string) ([]lineResult, error) {
-	data, err := e.handleResponse(uri)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parsing results
-	lines := strings.Split(string(data), "\n")
-	var results []lineResult = make([]lineResult, 0)
-
-	for i, line := range lines {
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("parseKeyValueResponse: unexpected %d line: %s", i, line)
-		}
-		k := strings.TrimSpace(parts[0])
-		v, err := parseNumber(strings.TrimSpace(parts[1]))
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, lineResult{k, v})
-
-	}
-	return results, nil
-}
-
 type partsResult struct {
 	database string
 	table    string
@@ -251,8 +207,96 @@ type partsResult struct {
 	parts    int
 	rows     int
 }
+type cdpEventsResult struct {
+	database string
+	table    string
+	count     int
+}
+func (e *Exporter) parseCdpEventsResponse() ([]cdpEventsResult, error) {
+	if nil != CacheResult {
+		fmt.Println("use cache", time.Now().Format("2006-01-02 15:04:05"))
+		return CacheResult, nil
+	}
 
+	err := e.getCdpEventsTableList()
+	if err != nil {
+		return nil,fmt.Errorf("Error scraping getCdpEventsTableList %s", err)
+	}
+	var results []cdpEventsResult = make([]cdpEventsResult, 0)
+	for _, tableName := range e.cdpEventsTableList {
+		if tableName == "" {
+			continue
+		}
+
+		uri := e.ckDomain
+		q := uri.Query()
+
+		cdpEventsURI := uri
+		sql := fmt.Sprintf("select count(*) as counts_events from xsy_dataplatform.%s where created_at > '%s'",tableName,  time.Now().Format("2006-01-02"))
+		// fmt.Printf("%s\n",sql)
+		q.Set("query", sql)
+		cdpEventsURI.RawQuery = q.Encode()
+
+		data, err := e.handleResponse(cdpEventsURI.String())
+		if err != nil {
+			fmt.Printf("%s\n",err)
+			return nil, err
+		}
+		count,err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			return nil, err
+		}
+
+		results = append(results, cdpEventsResult{"xsy_dataplatform", tableName,  count})
+	}
+	CacheResult = make([]cdpEventsResult, len(results))
+	copy(CacheResult, results)
+	// fmt.Printf("%s\n",results)
+
+	return results, nil
+}
 func (e *Exporter) parsePartsResponse(uri string) ([]partsResult, error) {
+	data, err := e.handleResponse(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parsing results
+	lines := strings.Split(string(data), "\n")
+	var results []partsResult = make([]partsResult, 0)
+
+	for i, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		if len(parts) != 5 {
+			return nil, fmt.Errorf("parsePartsResponse: unexpected %d line: %s", i, line)
+		}
+		database := strings.TrimSpace(parts[0])
+		table := strings.TrimSpace(parts[1])
+
+		bytes, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+		if err != nil {
+			return nil, err
+		}
+
+		count, err := strconv.Atoi(strings.TrimSpace(parts[3]))
+		if err != nil {
+			return nil, err
+		}
+
+		rows, err := strconv.Atoi(strings.TrimSpace(parts[4]))
+		if err != nil {
+			return nil, err
+		}
+
+		results = append(results, partsResult{database, table, bytes, count, rows})
+	}
+
+	return results, nil
+}
+func (e *Exporter) c(uri string) ([]partsResult, error) {
 	data, err := e.handleResponse(uri)
 	if err != nil {
 		return nil, err
