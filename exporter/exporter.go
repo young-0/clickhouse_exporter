@@ -232,7 +232,7 @@ func (e *Exporter) parseCdpEventsResponse() ([]cdpEventsResult, error) {
 		q := uri.Query()
 
 		cdpEventsURI := uri
-		sql := fmt.Sprintf("select count(*) as counts_events from xsy_dataplatform.%s where created_at > '%s'",tableName,  time.Now().Format("2006-01-02"))
+		sql := fmt.Sprintf("select count(*) as counts_events from xsy_dataplatform.%s where created_at > toDateTime('%s 00:00:00')",tableName,  time.Now().Format("2006-01-02"))
 		// fmt.Printf("%s\n",sql)
 		q.Set("query", sql)
 		cdpEventsURI.RawQuery = q.Encode()
